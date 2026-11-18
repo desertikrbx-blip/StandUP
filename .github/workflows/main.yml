@@ -2,38 +2,117 @@ name: Build StandUP APK
 
 on:
   workflow_dispatch:
+  push:
+    branches: [ main ]
+
+permissions:
+  contents: read
 
 jobs:
   build:
-    runs-on: ubuntu-22.04
+    name: Build Android APK
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Java
+      - name: Set up Java 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: 17
+          java-version: '17'
 
-      - name: Unzip project
+      - name: Set up Gradle 8.9
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Locate Android SDK tools
+        id: android-sdk
+        shell: bash
         run: |
-          unzip -o StandUP_Android_Project.zip -d project
+          set -euo pipefail
+          SDK_ROOT="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          if [[ ! -d "$SDK_ROOT" ]]; then
+            echo "Android SDK directory not found: $SDK_ROOT" >&2
+            exit 1
+          fi
+          SDKMANAGER="$(find "$SDK_ROOT/cmdline-tools" -type f -name sdkmanager 2>/dev/null | sort -V | tail -n 1 || true)"
+          if [[ -z "$SDKMANAGER" ]]; then
+            echo "sdkmanager was not found under $SDK_ROOT/cmdline-tools" >&2
+            exit 1
+          fi
+          echo "sdk_root=$SDK_ROOT" >> "$GITHUB_OUTPUT"
+          echo "sdkmanager=$SDKMANAGER" >> "$GITHUB_OUTPUT"
+          echo "$SDK_ROOT/platform-tools" >> "$GITHUB_PATH"
+          echo "$(dirname "$SDKMANAGER")" >> "$GITHUB_PATH"
 
-      - name: Check project
+      - name: Accept Android SDK licenses and install required packages
+        shell: bash
+        env:
+          SDK_ROOT: ${{ steps.android-sdk.outputs.sdk_root }}
+          SDKMANAGER: ${{ steps.android-sdk.outputs.sdkmanager }}
         run: |
-          find project -name settings.gradle -o -name gradlew
+          set -euo pipefail
+          yes | "$SDKMANAGER" --sdk_root="$SDK_ROOT" --licenses >/dev/null 2>&1 || true
+          "$SDKMANAGER" --sdk_root="$SDK_ROOT" --install \
+            'platforms;android-35' \
+            'build-tools;35.0.0'
 
-      - name: Build APK
+      - name: Find and extract Android project
+        id: source
+        shell: bash
         run: |
-          cd project
-          chmod +x gradlew
-          ./gradlew assembleDebug
+          set -euo pipefail
+          mkdir -p _standup_source
+          if [[ -f StandUP_GitHub_Ready.zip ]]; then
+            unzip -q -o StandUP_GitHub_Ready.zip -d _standup_source
+          elif [[ -f StandUP_Android_Project.zip ]]; then
+            unzip -q -o StandUP_Android_Project.zip -d _standup_source
+          elif [[ -f settings.gradle && -d app ]]; then
+            echo "project_dir=." >> "$GITHUB_OUTPUT"
+            exit 0
+          else
+            echo "No project archive found. Upload StandUP_GitHub_Ready.zip or StandUP_Android_Project.zip to the repository root." >&2
+            exit 1
+          fi
+          SETTINGS_FILE="$(find _standup_source -type f -name settings.gradle -print -quit)"
+          if [[ -z "$SETTINGS_FILE" ]]; then
+            echo "settings.gradle was not found inside the uploaded ZIP." >&2
+            exit 1
+          fi
+          PROJECT_DIR="$(dirname "$SETTINGS_FILE")"
+          if [[ ! -f "$PROJECT_DIR/app/src/main/assets/index.html" ]]; then
+            echo "The project is missing app/src/main/assets/index.html." >&2
+            exit 1
+          fi
+          echo "project_dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
 
-      - name: Upload APK
+      - name: Build debug APK
+        shell: bash
+        working-directory: ${{ steps.source.outputs.project_dir }}
+        run: gradle --no-daemon --stacktrace assembleDebug
+
+      - name: Prepare APK artifact
+        shell: bash
+        env:
+          PROJECT_DIR: ${{ steps.source.outputs.project_dir }}
+        run: |
+          set -euo pipefail
+          APK="$PROJECT_DIR/app/build/outputs/apk/debug/app-debug.apk"
+          if [[ ! -f "$APK" ]]; then
+            echo "APK was not created at $APK" >&2
+            find "$PROJECT_DIR/app/build/outputs" -maxdepth 5 -type f -print 2>/dev/null || true
+            exit 1
+          fi
+          cp "$APK" "$GITHUB_WORKSPACE/StandUP.apk"
+
+      - name: Upload StandUP.apk
         uses: actions/upload-artifact@v4
         with:
-          name: StandUP
-          path: project/**/build/outputs/apk/debug/*.apk
+          name: StandUP-APK
+          path: StandUP.apk
           if-no-files-found: error
+          retention-days: 14
